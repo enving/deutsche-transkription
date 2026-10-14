@@ -15,9 +15,11 @@ Hold a hotkey, speak, release — the transcribed text is typed wherever your cu
   - **OpenAI** cloud — `gpt-4o-mini-transcribe`, `gpt-4o-transcribe`, `whisper-1`
   - **Local** offline — `parakeet-primeline` (German fine-tune of `nvidia/parakeet-tdt-0.6b-v3`, int8 ONNX via [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx)). CPU-only, ~50 ms decode for 2 s audio at 4 threads. No network, no API key.
 - Optional minimum-hold threshold to ignore accidental modifier presses
+- **macOS**: Command-double-tap hotkey (Quartz sampler thread — pynput's listener crashes on current macOS), accessibility-trust prompt on first launch, hides while recording and types into the previously active app
 - API keys stored locally in `~/.config/dictate/config.json` (mode 600)
 - **Wayland-compatible**: uses `evdev` for key capture and `ydotool` for typing, falls back to `pynput`/`xdotool` on X11
-- **Windows / macOS**: `pip install PyQt6 sounddevice pynput requests numpy` and run `python gui.py`; hotkeys and typing go through `pynput`. Pair it with the Yorik provider and the machine needs no model.
+- **macOS**: run `python3 gui.py` from a venv (`pip install PyQt6 sounddevice pynput requests numpy sherpa-onnx soundfile`), or double-click **Dictate starten.command**. Pair it with the Yorik provider and the machine needs no model. Typing goes through `pynput`; the Command-double-tap hotkey polls via Quartz instead
+- **Windows**: `pip install PyQt6 sounddevice pynput requests numpy` and run `python gui.py`; hotkeys and typing go through `pynput`
 
 ## Requirements
 
@@ -44,6 +46,21 @@ The installer adds:
 The Parakeet ONNX model itself (~640 MB) is *not* downloaded by `install.sh` — the download is triggered on demand from Settings when you first pick the local backend, so users who only want cloud transcription don't pay the disk cost.
 
 If the installer added you to the `input` group you must log out and back in for it to take effect (or reboot — see WAYLAND_NOTES.md for the `systemd-linger` gotcha that can defeat a plain logout).
+
+## Install (macOS)
+
+```bash
+git clone https://github.com/winidi/dictate.git
+cd dictate
+python3 -m venv .venv
+./.venv/bin/pip install PyQt6 sounddevice pynput requests numpy sherpa-onnx soundfile huggingface_hub
+```
+
+Then either run `./.venv/bin/python gui.py` or double-click **Dictate starten.command** (uses the project-local `.venv`).
+
+For offline German dictation, double-click **Parakeet-Modell-laden.command**: it downloads the Parakeet model (~640 MB, resumable, checksum-verified) and switches Dictate to the local provider with the Command-double-tap hotkey in toggle mode. Restart Dictate once afterwards.
+
+On first launch macOS asks for permission to type into other windows (Bedienungshilfen) — allow it, otherwise transcription succeeds but no text arrives. The check runs on every launch, so it also heals itself after a Python upgrade replaced the binary.
 
 ## First run
 
