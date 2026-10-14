@@ -1,159 +1,83 @@
-# Dictate
+# Deutsche Transkription
 
-Voice dictation to keyboard on Linux — cloud (Groq / OpenAI) or fully offline (Parakeet, German, CPU).
+**Diktieren auf Deutsch — Hotkey drücken, sprechen, loslassen. Der Text steht in der App, in der der Cursor blinkt.**
 
-Hold a hotkey, speak, release — the transcribed text is typed wherever your cursor is. Works in any application (X11 and native Wayland alike), including editors, terminals, browsers, chat windows.
+Egal ob E-Mail, Editor, Terminal, Browser oder Chat: Deutsche Transkription tippt das Gesprochene systemweit in jedes Programm. Auf Wunsch **komplett offline** mit einem deutsch-optimierten Spracherkennungs-Modell — ohne Cloud, ohne Konto, ohne Abo. Läuft auf **macOS, Linux und Windows**.
 
-## Features
+## Warum besser als Apple- oder Windows-Diktat?
 
-- Push-to-talk or tap-to-toggle modes
-- System tray icon with status (ready / recording / transcribing)
-- Hotkey bound to any function key, modifier (Ctrl / Alt / Shift), or Logitech-style mouse side button
-- Four transcription backends:
-  - **Yorik** (home server) — sends the clip to a Yorik install on the LAN (`/v1/audio/transcriptions`, personal API token from Yorik's Settings → API tokens). One Parakeet for every device in the house; this machine carries no model.
-  - **Groq** cloud — `whisper-large-v3-turbo`, `whisper-large-v3`
-  - **OpenAI** cloud — `gpt-4o-mini-transcribe`, `gpt-4o-transcribe`, `whisper-1`
-  - **Local** offline — `parakeet-primeline` (German fine-tune of `nvidia/parakeet-tdt-0.6b-v3`, int8 ONNX via [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx)). CPU-only, ~50 ms decode for 2 s audio at 4 threads. No network, no API key.
-- Optional minimum-hold threshold to ignore accidental modifier presses
-- **macOS**: Command-double-tap hotkey (Quartz sampler thread — pynput's listener crashes on current macOS), accessibility-trust prompt on first launch, hides while recording and types into the previously active app
-- API keys stored locally in `~/.config/dictate/config.json` (mode 600)
-- **Wayland-compatible**: uses `evdev` for key capture and `ydotool` for typing, falls back to `pynput`/`xdotool` on X11
-- **macOS**: run `python3 gui.py` from a venv (`pip install PyQt6 sounddevice pynput requests numpy sherpa-onnx soundfile`), or double-click **Dictate starten.command**. Pair it with the Yorik provider and the machine needs no model. Typing goes through `pynput`; the Command-double-tap hotkey polls via Quartz instead
-- **Windows**: `pip install PyQt6 sounddevice pynput requests numpy` and run `python gui.py`; hotkeys and typing go through `pynput`
+|  | Deutsche Transkription | Apple Diktierfunktion | Windows-Spracherkennung |
+|---|---|---|---|
+| Plattformen | macOS, Linux, Windows | nur Apple-Geräte | nur Windows |
+| Quelloffen (MIT) | Ja | Nein | Nein |
+| Hersteller-Bindung | Keine | Apple-Gerät erforderlich | Windows erforderlich |
+| Komplett offline nutzbar | Ja, eingebaut (ein Klick) | Nur teilweise | Nur teilweise |
+| Deutsch-Spezialmodell | Ja (Parakeet-DE-Feinabstimmung) | Systemstandard | Systemstandard |
+| Anbieter frei wählbar (Cloud, eigener Server, offline) | Ja (Groq, OpenAI, Yorik, lokal) | Nein | Nein |
+| Eigener Server im Heimnetz | Ja (Yorik) | Nein | Nein |
+| Hotkey frei belegbar | Ja (F-Tasten, Modifier, Maus, Doppel-Tap) | Eingeschränkt | Eingeschränkt |
+| Konto erforderlich | Nein | Nein, aber Apple-Gerät | Nein, aber Windows |
 
-## Requirements
+Kurz: Die System-Diktate gehören zum Gerät — Deutsche Transkription gehört **dir**. Gleiche Bequemlichkeit (eine Taste, Text landet in jeder App), aber ohne Hersteller-Bindung, mit echtem Offline-Modus und einem Modell, das auf Deutsch trainiert ist.
 
-- Linux (X11 or Wayland — see the Wayland section below)
-- Python 3.10+
-- A microphone that PipeWire/PulseAudio can see
-- Either a Groq API key (free tier at [console.groq.com](https://console.groq.com)), an OpenAI API key — or nothing at all: the Local provider needs no key and no network
+## Funktionen
 
-## Install
+- Push-to-talk (halten) oder Toggle (antippen zum Starten/Stoppen)
+- Tray-Icon mit Status (bereit / Aufnahme / Transkription)
+- Vier Transkriptions-Wege:
+  - **Lokal (Parakeet DE, CPU, offline)** — deutsche Feinabstimmung von `nvidia/parakeet-tdt-0.6b-v3` (int8 ONNX via [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx)). ~50 ms Dekodierung für 2 s Sprache bei 4 Threads. Kein Netz, kein Schlüssel.
+  - **Yorik (Heimserver)** — ein Parakeet für alle Geräte im Haus; dieser Rechner braucht kein Modell.
+  - **Groq**-Cloud (`whisper-large-v3-turbo`, `whisper-large-v3`)
+  - **OpenAI**-Cloud (`gpt-4o-mini-transcribe`, `gpt-4o-transcribe`, `whisper-1`)
+- Hotkey frei wählbar: F1–F12, Modifier (Strg/Alt/Shift), Maus-Seitentasten — auf macOS zusätzlich **Command-Doppeltipp**
+- Mindest-Haltedauer gegen versehentliche Auslöser
+- Schlüssel liegen lokal in `~/.config/dictate/config.json` (Modus 600)
 
-```bash
-git clone https://github.com/winidi/dictate.git
-cd dictate
-./install.sh
-```
-
-The installer adds:
-
-- system packages: `xdotool`, `ydotool`, `python3-evdev`, `libnotify-bin`, `python3-pip`, `libxcb-cursor0`, `libportaudio2`
-- Python packages: `PyQt6`, `sounddevice`, `pynput`, `requests`, `numpy`, `sherpa-onnx`, `soundfile`, `huggingface_hub`
-- membership in group `input` (needed for evdev on Wayland)
-- a desktop entry so **Dictate** shows up in your app menu
-
-The Parakeet ONNX model itself (~640 MB) is *not* downloaded by `install.sh` — the download is triggered on demand from Settings when you first pick the local backend, so users who only want cloud transcription don't pay the disk cost.
-
-If the installer added you to the `input` group you must log out and back in for it to take effect (or reboot — see WAYLAND_NOTES.md for the `systemd-linger` gotcha that can defeat a plain logout).
-
-## Install (macOS)
+## Schnellstart (macOS)
 
 ```bash
-git clone https://github.com/winidi/dictate.git
-cd dictate
+git clone https://github.com/enving/deutsche-transkription.git
+cd deutsche-transkription
 python3 -m venv .venv
 ./.venv/bin/pip install PyQt6 sounddevice pynput requests numpy sherpa-onnx soundfile huggingface_hub
 ```
 
-Then either run `./.venv/bin/python gui.py` or double-click **Dictate starten.command** (uses the project-local `.venv`).
+Danach **Dictate starten.command** doppelklicken (nutzt die projekt-lokale `.venv`). Für Offline-Deutsch **Parakeet-Modell-laden.command** doppelklicken: lädt das Modell (~640 MB, fortsetzbar, prüfsummen-verifiziert) und stellt alles um. Dictate einmal neu starten — fertig.
 
-For offline German dictation, double-click **Parakeet-Modell-laden.command**: it downloads the Parakeet model (~640 MB, resumable, checksum-verified) and switches Dictate to the local provider with the Command-double-tap hotkey in toggle mode. Restart Dictate once afterwards.
+Beim ersten Start fragt macOS nach der Berechtigung, in andere Fenster zu tippen (Bedienungshilfen) — erlauben, sonst kommt transkribierter Text nie im Zielfenster an. Die Prüfung läuft bei jedem Start und heilt sich z. B. nach einem Python-Update selbst.
 
-On first launch macOS asks for permission to type into other windows (Bedienungshilfen) — allow it, otherwise transcription succeeds but no text arrives. The check runs on every launch, so it also heals itself after a Python upgrade replaced the binary.
-
-## First run
-
-Launch **Dictate** from the app menu (or `python3 gui.py`). On first launch you will be prompted to pick a provider and paste an API key.
-
-## Usage
-
-Default hotkey is **F9**. Hold it, speak, release. The transcription is typed at the cursor.
-
-In **Settings** you can change:
-
-- **Provider** — Groq, OpenAI, or Local (Parakeet DE)
-- **Mode** — push-to-talk (hold) or toggle (tap to start / tap to stop)
-- **Hotkey** — F1–F12, modifier keys (Ctrl / Alt / Shift / Super), or one of the Logitech-style mouse side buttons (`MOUSE BACK`, `MOUSE FORWARD`, `MOUSE SIDE`, `MOUSE EXTRA`, `MOUSE TASK`). Mouse buttons only work with the evdev backend (i.e. `input`-group setup complete).
-- **Model** — provider-specific list (cloud only)
-- **CPU threads** (Local only) — sherpa-onnx worker threads. 4 is the sweet spot on typical CPUs; more brings little benefit and starves the rest of the system.
-- **Min hold to send** — recordings shorter than this duration are discarded. Recommended ~2.0s when bound to Ctrl / Alt / Shift so regular keyboard shortcuts do not trigger recording.
-
-## Local (offline) transcription
-
-Selecting the **Local (Parakeet DE, CPU offline)** provider gives you German dictation with no network at all. On first selection Settings shows a "Download model (~640 MB)" button — the ONNX weights come from the pinned HuggingFace revision of [`flozen1981/parakeet-primeline-onnx`](https://huggingface.co/flozen1981/parakeet-primeline-onnx) and land in `~/.local/share/dictate/models/parakeet-primeline-onnx/`.
-
-Latency on a modest desktop CPU (measured on a Ryzen 9 workstation, 4 sherpa-onnx threads): about 50 ms decode for a 2 s clip, 100 ms for a 5 s clip. Model load + warmup happens once in the background at Dictate startup (~0.8 s).
-
-Attribution (CC-BY-4.0): [primeline](https://huggingface.co/flozen1981/parakeet-primeline-onnx) (fine-tune), [NVIDIA](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3) (base model), [k2-fsa/sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) (runtime).
-
-## Wayland notes
-
-On Wayland (GNOME Mutter in particular) the compositor does not forward global key events to XWayland, so `pynput`'s X-based listener sees nothing. Dictate works around this by reading `/dev/input/event*` directly via `evdev`. The `install.sh` script sets this up. Typing likewise uses `ydotool` (via `/dev/uinput`) because `xdotool` cannot type into native Wayland windows.
-
-If a hotkey silently does nothing after install, the two things to check are:
-
-1. `groups | grep input` — you must be in the `input` group in the current session. A fresh login is required; on Ubuntu the "Log out" menu item is often hidden when only one account exists, use `gnome-session-quit --logout --no-prompt` or reboot.
-2. The Dictate GUI window has a status label. If it never turns "Recording" while you hold the hotkey, evdev is not receiving events. If it turns "Recording" but not "Transcribing" when you release, your microphone is not producing audio — see the troubleshooting section.
-
-## Troubleshooting
-
-**A dictation went nowhere**
-
-- Every recording leaves one line in `~/.local/state/dictate/dictate.log` (length, peak level, characters, decode time — never the text). A failed one also raises a desktop notification: no audio frames, silent microphone (`peak` under 300 of 32768), nothing recognised, recording cancelled by another key or mouse button while the hotkey was held, or typing failed
-- The local Parakeet model cannot take more than 400 s in one pass; recordings over 90 s are split at a pause and decoded in pieces. Quiet audio is raised in level before decoding, and a piece that still comes back empty is retried in 20 s parts
-- A recording that had sound but produced no text is saved as a WAV in `~/.local/state/dictate/failed/`, so the failure can be replayed. This is your own voice on disk: only the newest 3 are kept, nothing is uploaded, and you can delete the folder at any time
-
-**Hotkey does nothing / status never changes to "Recording..."**
-
-- Verify `groups | grep input` in the same terminal you launched Dictate from
-- Check the launcher output for `keyboard listener: evdev`. If it says `evdev unavailable (...) falling back to pynput`, evdev could not open `/dev/input/event*` and pynput will be silently blind on Wayland
-
-**Status turns to "Transcribing..." but never returns to "Ready" (or comes back with empty text)**
-
-- Your PipeWire default source may point at a device that is not currently plugged in. `wpctl status` shows both the runtime default (`*` next to a source) and the *configured* default at the bottom (`Default Configured Node Names`). If the configured default is a mic you have unplugged, `sd.rec()` will hang instead of falling back
-- Fix with `wpctl set-default <ID>` for a live source, or pick an input in GNOME Sound Settings
-
-**Text is transcribed (visible in the "Last transcription" pane) but nothing appears in your target window**
-
-- `ydotool` is missing or `/dev/uinput` is not writable. Reinstall with `sudo apt install ydotool` and confirm `python3 -c 'import os; os.open("/dev/uinput", os.O_WRONLY)'` succeeds. On systemd systems membership in `input` should be enough
-
-**GUI freezes for a few seconds when releasing the hotkey**
-
-- Should not happen since the audio-stop + transcribe pipeline runs in a worker thread. If it does, check the launcher stderr for exceptions
-
-See `WAYLAND_NOTES.md` for the longer story of the four combined bugs that had to be untangled to make this work on GNOME Wayland with NVIDIA.
-
-## CLI variant
-
-There is also a headless `dictate.py` (unchanged from initial release, uses `pynput` + `xdotool` directly) that reads the API key from the `GROQ_API_KEY` environment variable:
+## Schnellstart (Linux)
 
 ```bash
-export GROQ_API_KEY=gsk_...
-python3 dictate.py --mode ptt --key f9
+git clone https://github.com/enving/deutsche-transkription.git
+cd deutsche-transkription
+./install.sh
 ```
 
-The CLI variant only works on X11 for the reasons described above. Use `gui.py` on Wayland.
+Richtet Systempakete, Python-Pakete, `input`-Gruppe (für Wayland) und einen Menüeintrag ein. Nach Gruppenänderung einmal ab-/anmelden. Details und Fallstricke: `WAYLAND_NOTES.md`.
 
-## Configuration file
+## Schnellstart (Windows)
 
-`~/.config/dictate/config.json`:
-
-```json
-{
-  "provider": "groq",
-  "api_key": "gsk_...",
-  "openai_api_key": "sk-...",
-  "mode": "ptt",
-  "key": "f9",
-  "model": "whisper-large-v3-turbo",
-  "threshold": 0.0,
-  "local_stt_num_threads": 4
-}
+```bash
+pip install PyQt6 sounddevice pynput requests numpy
+python gui.py
 ```
 
-For `provider`, valid values are `"groq"`, `"openai"`, or `"parakeet_local"`.
+Hotkeys und Tippen laufen über `pynput`. Mit dem Yorik-Anbieter braucht der Rechner kein Modell.
 
-## License
+## Einstellungen
 
-MIT. See [LICENSE](LICENSE).
+Standard-Hotkey ist **F9**: halten, sprechen, loslassen. In den **Settings** lassen sich Anbieter, Modus (Push-to-talk/Toggle), Hotkey, Modell, CPU-Threads (lokal) und Mindest-Haltedauer ändern.
+
+## Datenschutz
+
+- Der lokale Anbieter schickt **nichts** ins Netz — Erkennung läuft auf der eigenen CPU.
+- Fehlgeschlagene Aufnahmen mit hörbarem Ton landen als WAV unter `~/.local/state/dictate/failed/` (nur die neuesten 3, nichts wird hochgeladen, Ordner jederzeit löschbar).
+- Das Protokoll (`~/.local/state/dictate/dictate.log`) enthält nur Längen, Pegel und Zeiten — **nie** den transkribierten Text.
+- Cloud-Anbieter übertragen nur den jeweiligen Audio-Schnipsel an den gewählten Dienst.
+
+## Herkunft und Dank
+
+Deutsche Transkription baut auf [Dictate](https://github.com/winidi/dictate) (MIT) auf, erweitert um macOS-Ausbau (Quartz-Hotkey, Bedienungshilfen-Dialog, Starter-Skripte). Modell: [parakeet-primeline](https://huggingface.co/flozen1981/parakeet-primeline-onnx) (CC-BY-4.0, Feinabstimmung), [NVIDIA](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3) (Basismodell), [k2-fsa/sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) (Laufzeitumgebung).
+
+Lizenz: MIT (siehe `LICENSE`).
