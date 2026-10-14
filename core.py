@@ -90,32 +90,38 @@ def setup_logging():
     log.addHandler(h)
     log.setLevel(logging.INFO)
 
-KEY_MAP = {f"f{i}": {getattr(keyboard.Key, f"f{i}")} for i in range(1, 13)}
+def _keys(*names):
+    return {k for k in (getattr(keyboard.Key, n, None) for n in names) if k is not None}
+
+
+KEY_MAP = {f"f{i}": _keys(f"f{i}") for i in range(1, 13)}
+KEY_MAP = {k: v for k, v in KEY_MAP.items() if v}
+
 KEY_MAP.update({
-    "pause":       {keyboard.Key.pause},
-    "scroll_lock": {keyboard.Key.scroll_lock},
-    "insert":      {keyboard.Key.insert},
-    "home":        {keyboard.Key.home},
-    "end":         {keyboard.Key.end},
-    "page_up":     {keyboard.Key.page_up},
-    "page_down":   {keyboard.Key.page_down},
-    "caps_lock":   {keyboard.Key.caps_lock},
-    "ctrl":        {keyboard.Key.ctrl, keyboard.Key.ctrl_l, keyboard.Key.ctrl_r},
-    "ctrl_l":      {keyboard.Key.ctrl_l},
-    "ctrl_r":      {keyboard.Key.ctrl_r},
-    "alt":         {keyboard.Key.alt, keyboard.Key.alt_l, keyboard.Key.alt_r},
-    "alt_l":       {keyboard.Key.alt_l},
-    "alt_r":       {keyboard.Key.alt_r, keyboard.Key.alt_gr},
-    "shift":       {keyboard.Key.shift, keyboard.Key.shift_l, keyboard.Key.shift_r},
-    "super":       {keyboard.Key.cmd, keyboard.Key.cmd_l, keyboard.Key.cmd_r},
-    # Mouse-side buttons. Sentinels are tuples emitted by evdev_listener;
-    # pynput won't see these (mouse events go through a separate listener) —
-    # so these hotkeys only work when the evdev backend is active.
-    "mouse_back":    {("mouse", "back")},
-    "mouse_forward": {("mouse", "forward")},
-    "mouse_side":    {("mouse", "side")},
-    "mouse_extra":   {("mouse", "extra")},
-    "mouse_task":    {("mouse", "task")},
+    name: keys for name, keys in {
+        "pause":       _keys("pause"),
+        "scroll_lock": _keys("scroll_lock"),
+        "insert":      _keys("insert"),
+        "home":        _keys("home"),
+        "end":         _keys("end"),
+        "page_up":     _keys("page_up"),
+        "page_down":   _keys("page_down"),
+        "caps_lock":   _keys("caps_lock"),
+        "ctrl":        _keys("ctrl", "ctrl_l", "ctrl_r"),
+        "ctrl_l":      _keys("ctrl_l"),
+        "ctrl_r":      _keys("ctrl_r"),
+        "alt":         _keys("alt", "alt_l", "alt_r"),
+        "alt_l":       _keys("alt_l"),
+        "alt_r":       _keys("alt_r", "alt_gr"),
+        "shift":       _keys("shift", "shift_l", "shift_r"),
+        "super":       _keys("cmd", "cmd_l", "cmd_r"),
+        "cmd_double_tap": _keys("cmd", "cmd_l", "cmd_r"),
+        "mouse_back":    {("mouse", "back")},
+        "mouse_forward": {("mouse", "forward")},
+        "mouse_side":    {("mouse", "side")},
+        "mouse_extra":   {("mouse", "extra")},
+        "mouse_task":    {("mouse", "task")},
+    }.items() if keys
 })
 
 DEFAULT_CONFIG = {

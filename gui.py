@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 """Dictate GUI — PyQt6 tray app for voice dictation via Groq Whisper."""
-import fcntl
 import sys
 import threading
 import time
+
+try:
+    import fcntl
+except ImportError:  # Windows / minimal Python: no POSIX file locking
+    fcntl = None  # type: ignore[assignment]
 
 import numpy as np
 from PyQt6.QtCore import Qt, QObject, QTimer, pyqtSignal
@@ -35,9 +39,136 @@ def _make_listener(on_press, on_release):
         return l
 
 
+# --- macOS Command double-tap poller (pynput-free) ---
+#
+# pynput's macOS Listener resolves the keyboard layout through HIToolbox
+# (TISGetInputSourceProperty) on its worker thread. Since macOS 26 that trips
+# `dispatch_assert_queue` and kills the process with SIGTRAP -- we saw this
+# live on 2026-10-14 (Thread 21: Listener._run -> keycode_context ->
+# TSMGetInputSourceProperty -> _dispatch_assert_queue_fail). The typing path
+# is safe because it runs on the Qt main thread, but the listener thread can
+# never be. So on macOS we do not use pynput's Listener at all for the
+# Command double-tap hotkey: a sampler thread polls the physical key state
+# instead. CGEventSourceKeyState needs no layout resolution, so HIToolbox is
+# never touched off-main. (An earlier QTimer-on-main-thread attempt was
+# throttled by App Nap to ~21 Hz when hidden and ate fast taps, hence the
+# dedicated thread + power assertion + QoS bump below.)
+try:
+    if sys.platform == "darwin":
+        import Quartz
+        _QUARTZ_OK = hasattr(Quartz, "CGEventSourceKeyState")
+    else:
+        _QUARTZ_OK = False
+except Exception:
+    _QUARTZ_OK = False
+
+_CMD_VKS = (55, 54)  # left / right Command (physical keycodes, layout-independent)
+
+
+class _CmdTapPoller(QObject):
+    """Detects Command double-taps by polling HID key state. Runs its
+    sampler on a worker thread, not on a QTimer: hidden background apps get
+    their runloop timers throttled (~21 Hz measured instead of 100 Hz),
+    which silently eats fast taps. A sleeping sampler thread holds its
+    cadence. This is crash-safe unlike pynput's listener thread because it
+    never resolves keyboard layouts -- CGEventSourceKeyState needs no TSM,
+    and taps reach the main thread through queued bridge signals."""
+
+    POLL_S = 0.01
+    _SCAN_VKS = tuple(vk for vk in range(128) if vk not in _CMD_VKS)
+
+    def __init__(self, on_down, on_up, on_other):
+        super().__init__()
+        self._on_down = on_down
+        self._on_up = on_up
+        self._on_other = on_other
+        self._prev_cmd = False
+        self._last_beat = 0.0
+        # Dictate hides itself while recording; hold a user-initiated power
+        # assertion so background sampling keeps its cadence (App Nap).
+        self._nap_guard = None
+        try:
+            from AppKit import NSProcessInfo, NSActivityUserInitiated
+            self._nap_guard = NSProcessInfo.processInfo(
+                ).beginActivityWithOptions_reason_(
+                    NSActivityUserInitiated,
+                    "Command double-tap hotkey polling")
+        except Exception:
+            pass
+        self._stop_event = threading.Event()
+        self._thread = threading.Thread(target=self._run_loop, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop_event.set()
+        self._thread.join(timeout=1.0)
+        try:
+            if self._nap_guard is not None:
+                from AppKit import NSProcessInfo
+                NSProcessInfo.processInfo().endActivity_(self._nap_guard)
+                self._nap_guard = None
+        except Exception:
+            pass
+
+    def _run_loop(self):
+        # Background apps run their threads at background QoS, where the
+        # kernel leashes wakeups to ~50 ms -- too coarse for tap detection.
+        # Opt this thread out; the power assertion alone does not cover it.
+        try:
+            import ctypes
+            import ctypes.util
+            libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+            QOS_CLASS_USER_INITIATED = 0x19
+            libc.pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0)
+        except Exception:
+            pass
+        while not self._stop_event.is_set():
+            try:
+                self._tick()
+            except Exception:
+                core.log.exception("poller tick failed")
+            time.sleep(self.POLL_S)
+
+    def _tick(self):
+        hid = Quartz.kCGEventSourceStateHIDSystemState
+        cmd = any(Quartz.CGEventSourceKeyState(hid, vk) for vk in _CMD_VKS)
+        # Quiet liveness proof in the log (one line per 5 min): distinguishes
+        # "listener dead" from "no taps happened" in later debugging.
+        now = time.monotonic()
+        if now - self._last_beat >= 300:
+            self._last_beat = now
+            core.log.info("poller heartbeat (cmd hotkey active)")
+        other_edge = False
+        if cmd or self._prev_cmd:
+            # Only scan for other keys around Command activity; idle polling
+            # stays at two HID lookups per tick.
+            prev = getattr(self, "_prev_other", frozenset())
+            cur = frozenset(
+                vk for vk in self._SCAN_VKS if Quartz.CGEventSourceKeyState(hid, vk)
+            )
+            other_edge = bool(cur - prev)
+            self._prev_other = cur
+        self.handle(cmd, other_edge)
+
+    def handle(self, cmd_down, other_edge):
+        """Pure transition logic (no Quartz here, so unit-testable headless).
+        Mirrors the pynput on_press/on_release semantics for cmd_double_tap:
+        press sets held, any other key while held poisons the tap, release
+        resolves single vs. double tap."""
+        was = self._prev_cmd
+        if cmd_down and not was:
+            self._on_down()
+        if other_edge and (was or cmd_down):
+            self._on_other()
+        if was and not cmd_down:
+            self._on_up()
+        self._prev_cmd = cmd_down
+
+
 class Bridge(QObject):
     hotkey_press = pyqtSignal()
     hotkey_release = pyqtSignal()
+    hotkey_double_tap = pyqtSignal()
     other_press = pyqtSignal()
     transcribed = pyqtSignal(str)
     error = pyqtSignal(str)
@@ -348,6 +479,7 @@ class MainWindow(QMainWindow):
         self.bridge = Bridge()
         self.bridge.hotkey_press.connect(self.on_press)
         self.bridge.hotkey_release.connect(self.on_release)
+        self.bridge.hotkey_double_tap.connect(self.on_double_tap)
         self.bridge.other_press.connect(self.on_other_press)
         self.bridge.transcribed.connect(self.on_transcribed)
         self.bridge.error.connect(self.on_error)
@@ -357,6 +489,11 @@ class MainWindow(QMainWindow):
         self.listener = None
         self._target_keys = set()
         self._last_other = None
+        self._first_cmd_tap = None
+        self._cmd_tap_held = False
+        self._cmd_tap_interrupted = False
+        self._last_dictation_app = None
+        self._dictation_target = None
 
         self.press_time = 0.0
 
@@ -415,9 +552,52 @@ class MainWindow(QMainWindow):
         self.update_info()
         self.start_listener()
         self._preload_local_if_needed()
+        self._ensure_typing_trust()
 
         if not core.provider_key(self.cfg):
             QTimer.singleShot(250, self.first_run)
+
+    def _ensure_typing_trust(self):
+        """Typed text reaches other apps only if macOS trusts this process
+        (Bedienungshilfen). Without trust, CGEventPost is silently dropped:
+        transcription succeeds, but nothing arrives -- exactly the "text is
+        in the app but never in the target" symptom. Terminal-started runs
+        inherit trust, launchd runs do not, so check on every launch and
+        raise the official system prompt when missing (self-healing, e.g.
+        after a Python upgrade replaces the binary)."""
+        if sys.platform != "darwin":
+            return
+        try:
+            import ctypes
+            import ctypes.util
+            aslib = ctypes.cdll.LoadLibrary(
+                "/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices")
+            aslib.AXIsProcessTrusted.restype = ctypes.c_bool
+            if aslib.AXIsProcessTrusted():
+                return
+            QMessageBox.information(
+                self, "Dictate",
+                "Dictate darf noch nicht in andere Fenster tippen.\n\n"
+                "Bitte im nächsten Dialog den Zugriff erlauben "
+                "(Bedienungshilfen) -- danach landet diktierter Text "
+                "im Zielfenster.")
+            cf = ctypes.cdll.LoadLibrary(
+                "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")
+            k_prompt = ctypes.c_void_p.in_dll(aslib, "kAXTrustedCheckOptionPrompt")
+            k_true = ctypes.c_void_p.in_dll(cf, "kCFBooleanTrue")
+            cf.CFDictionaryCreate.restype = ctypes.c_void_p
+            cf.CFDictionaryCreate.argtypes = [ctypes.c_void_p,
+                                              ctypes.POINTER(ctypes.c_void_p),
+                                              ctypes.POINTER(ctypes.c_void_p),
+                                              ctypes.c_long, ctypes.c_void_p, ctypes.c_void_p]
+            keys = (ctypes.c_void_p * 1)(k_prompt)
+            vals = (ctypes.c_void_p * 1)(k_true)
+            opts = cf.CFDictionaryCreate(None, keys, vals, 1, None, None)
+            aslib.AXIsProcessTrustedWithOptions.restype = ctypes.c_bool
+            aslib.AXIsProcessTrustedWithOptions.argtypes = [ctypes.c_void_p]
+            aslib.AXIsProcessTrustedWithOptions(opts)
+        except Exception:
+            pass
 
     def _preload_local_if_needed(self):
         """Kick off the parakeet recognizer load in the background so the first
@@ -447,10 +627,14 @@ class MainWindow(QMainWindow):
 
     def update_info(self):
         mode_name = "Push-to-talk" if self.cfg["mode"] == "ptt" else "Toggle"
+        hotkey_name = (
+            "COMMAND DOUBLE TAP" if self.cfg["key"] == "cmd_double_tap"
+            else self.cfg["key"].upper().replace("_", " ")
+        )
         thr = float(self.cfg.get("threshold", 0.0))
         thr_str = f"     Min hold: {thr:.1f}s" if thr > 0 else ""
         self.info_label.setText(
-            f"Mode: {mode_name}     Hotkey: {self.cfg['key'].upper()}     "
+            f"Mode: {mode_name}     Hotkey: {hotkey_name}     "
             f"Model: {self.cfg['model']}{thr_str}"
         )
 
@@ -464,6 +648,16 @@ class MainWindow(QMainWindow):
             self._preload_local_if_needed()
 
     def start_listener(self):
+        if (sys.platform == "darwin" and _QUARTZ_OK
+                and self.cfg["key"] == "cmd_double_tap"):
+            self._target_keys = set()
+            print("keyboard listener: Quartz poller (sampler thread)", file=sys.stderr)
+            self.listener = _CmdTapPoller(
+                on_down=self._cmd_tap_down,
+                on_up=self._cmd_tap_up,
+                on_other=self._cmd_tap_other,
+            )
+            return
         keys = core.KEY_MAP.get(self.cfg["key"])
         if not keys:
             return
@@ -472,9 +666,19 @@ class MainWindow(QMainWindow):
         def on_press(k):
             try:
                 if k in self._target_keys:
+                    if self.cfg["key"] == "cmd_double_tap":
+                        self._cmd_tap_down()
+                        return
                     self.bridge.hotkey_press.emit()
                 else:
-                    self._last_other = k
+                    # Only a key pressed *while Command is held* turns this
+                    # into a shortcut. Synthetic keystrokes from the last
+                    # dictation arrive after Command was released and must
+                    # not poison the following double tap.
+                    if self.cfg["key"] == "cmd_double_tap":
+                        self._cmd_tap_other(k)
+                    else:
+                        self._last_other = k
                     self.bridge.other_press.emit()
             except Exception:
                 pass
@@ -482,11 +686,33 @@ class MainWindow(QMainWindow):
         def on_release(k):
             try:
                 if k in self._target_keys:
+                    if self.cfg["key"] == "cmd_double_tap":
+                        self._cmd_tap_up()
+                        return
                     self.bridge.hotkey_release.emit()
             except Exception:
                 pass
 
         self.listener = _make_listener(on_press, on_release)
+
+    def _cmd_tap_down(self):
+        self._cmd_tap_held = True
+
+    def _cmd_tap_other(self, _key=None):
+        if self._cmd_tap_held:
+            self._cmd_tap_interrupted = True
+
+    def _cmd_tap_up(self):
+        self._cmd_tap_held = False
+        now = time.monotonic()
+        if self._cmd_tap_interrupted:
+            self._first_cmd_tap = None
+            self._cmd_tap_interrupted = False
+        elif self._first_cmd_tap is not None and now - self._first_cmd_tap <= 0.45:
+            self._first_cmd_tap = None
+            self.bridge.hotkey_double_tap.emit()
+        else:
+            self._first_cmd_tap = now
 
     def restart_listener(self):
         if self.listener:
@@ -512,6 +738,14 @@ class MainWindow(QMainWindow):
                 self.recording_active = False
             elif self.start_recording():
                 self.recording_active = True
+
+    def on_double_tap(self):
+        """Toggle recording after two clean Command-key taps on macOS."""
+        if self.recording_active:
+            self.stop_and_transcribe()
+            self.recording_active = False
+        elif self.start_recording():
+            self.recording_active = True
 
     def on_other_press(self):
         if not self.key_held:
@@ -561,8 +795,27 @@ class MainWindow(QMainWindow):
             core.log.exception("could not open the microphone")
             self.on_error(f"Microphone: {e}")
             return False
+        # Remember where the text belongs BEFORE hiding: whoever is frontmost
+        # now is the dictation target. Typing later goes there even if the
+        # user brought Dictate forward while waiting (its read-only pane
+        # would otherwise swallow the keystrokes unnoticed).
+        self._dictation_target = self._frontmost_app_id()
         self.set_status("recording", "Recording...")
+        self._hide_for_dictation()
         return True
+
+    def _hide_for_dictation(self):
+        """Give the previous application input focus while Dictate records."""
+        if sys.platform == "darwin":
+            try:
+                # Hiding the complete NSApplication, rather than merely this
+                # window, makes macOS activate the previously used app.
+                from AppKit import NSApp
+                NSApp.hide_(None)
+                return
+            except Exception:
+                pass
+        self.hide()
 
     def stop_and_transcribe(self):
         # recorder.stop() can block for hundreds of ms on PipeWire close,
@@ -612,9 +865,62 @@ class MainWindow(QMainWindow):
 
     def on_transcribed(self, text):
         if text:
-            threading.Thread(target=core.type_text, args=(text,), daemon=True).start()
+            # On macOS pynput queries the active input source through Cocoa.
+            # Cocoa asserts if that happens off the app's main (Qt) thread,
+            # terminating Python with SIGTRAP after a successful transcript.
+            # This slot is delivered on the Qt main thread, so type here.
+            target_app = self._dictation_target or self._frontmost_app_id()
+            self._dictation_target = None
+            if target_app:
+                self._focus_app(target_app)
+            needs_space = (
+                target_app is not None
+                and target_app == self._last_dictation_app
+                and not text[:1].isspace()
+                and text[:1] not in ".,;:!?…)]}"
+            )
+            core.type_text((" " if needs_space else "") + text)
+            self._last_dictation_app = target_app
             self.last.setPlainText(text)
         self.set_status("ready", "Ready")
+
+    @staticmethod
+    def _frontmost_app_id():
+        """Return the macOS app currently receiving keyboard input."""
+        if sys.platform != "darwin":
+            return None
+        try:
+            from AppKit import NSWorkspace
+            app = NSWorkspace.sharedWorkspace().frontmostApplication()
+            return str(app.bundleIdentifier()) if app else None
+        except Exception:
+            return None
+
+    @staticmethod
+    def _focus_app(bundle_id):
+        """Bring the dictation target forward before typing. NO-OP unless it
+        is needed: if Dictate itself (or the target already) is frontmost,
+        typing goes wherever the system points today, as before. Failures
+        (app quit meanwhile) fall back to that same behavior."""
+        if sys.platform != "darwin":
+            return
+        try:
+            from AppKit import (NSRunningApplication,
+                                NSApplicationActivateIgnoringOtherApps,
+                                NSWorkspace)
+            ws = NSWorkspace.sharedWorkspace()
+            mine = NSRunningApplication.currentApplication().bundleIdentifier()
+            front = ws.frontmostApplication()
+            front_id = str(front.bundleIdentifier()) if front else None
+            if str(bundle_id) == str(mine) or str(bundle_id) == str(front_id):
+                return
+            for app in ws.runningApplications():
+                if str(app.bundleIdentifier()) == str(bundle_id):
+                    app.activateWithOptions_(NSApplicationActivateIgnoringOtherApps)
+                    time.sleep(0.35)
+                    return
+        except Exception:
+            pass
 
     def on_error(self, msg):
         self.set_status("error", f"Error: {msg[:80]}")
@@ -653,6 +959,8 @@ _LOCK_FD = None
 
 def acquire_single_instance_lock():
     global _LOCK_FD
+    if fcntl is None:
+        return True
     core.CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     lock_path = core.CONFIG_DIR / "dictate.lock"
     fd = open(lock_path, "w")
