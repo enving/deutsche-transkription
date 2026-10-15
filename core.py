@@ -5,7 +5,9 @@ import logging
 import logging.handlers
 import subprocess
 import threading
+import time
 import wave
+from collections import deque
 from pathlib import Path
 
 import numpy as np
@@ -237,6 +239,10 @@ class Recorder:
     def __init__(self):
         self._take = None
         self.lock = threading.Lock()
+        # (timestamp, chunk peak) ring for the live level meter. Appended by
+        # the audio callback, pruned on read; bounded so headless long
+        # recordings cannot grow it without a reader.
+        self._peaks = deque(maxlen=500)
 
     @property
     def recording(self):
@@ -247,9 +253,11 @@ class Recorder:
             if self._take is not None:
                 return
             frames = []
+            self._peaks.clear()
 
             def callback(indata, n, time_info, status):
                 frames.append(indata.copy())
+                self._peaks.append((time.monotonic(), int(np.abs(indata).max())))
 
             stream = sd.InputStream(
                 samplerate=SAMPLE_RATE,
@@ -259,6 +267,15 @@ class Recorder:
             )
             stream.start()
             self._take = (stream, frames)
+
+    def level(self):
+        """Peak level of roughly the last 1.5 s, 0..32768 (0 when idle).
+        Cheap enough to poll from a GUI timer; never touches the take."""
+        cutoff = time.monotonic() - 1.5
+        with self.lock:
+            while self._peaks and self._peaks[0][0] < cutoff:
+                self._peaks.popleft()
+            return max((p for _, p in self._peaks), default=0)
 
     def detach(self):
         """Non-blocking: give up the current take (or None). Safe on the GUI thread."""
@@ -300,6 +317,26 @@ def to_wav_bytes(audio):
 
 FAILED_DIR = LOG_PATH.parent / "failed"
 FAILED_KEEP = 3
+
+
+TRANSCRIPT_DIR = Path.home() / "Documents" / "Transcripts"
+
+
+def archive_transcript(text, when=None):
+    """Save a successful transcription as its own markdown file, so no
+    dictation is ever lost even if typing into the target failed. Filename
+    carries the full recording timestamp (year-month-day_hour-min-sec).
+    Never raises."""
+    try:
+        import time as _time
+        TRANSCRIPT_DIR.mkdir(parents=True, exist_ok=True)
+        stamp = when or _time.strftime("%Y-%m-%d_%H-%M-%S")
+        path = TRANSCRIPT_DIR / f"{stamp}.md"
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(f"# {stamp}\n\n{text}\n")
+        log.info("archived %d chars to %s", len(text or ""), path)
+    except Exception:
+        log.exception("could not archive transcript")
 
 
 def keep_failed_audio(audio):

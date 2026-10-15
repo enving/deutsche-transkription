@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Dictate GUI — PyQt6 tray app for voice dictation via Groq Whisper."""
+import math
 import sys
 import threading
 import time
@@ -15,7 +16,7 @@ from PyQt6.QtGui import QAction, QColor, QIcon, QPainter, QPixmap
 from PyQt6.QtWidgets import (
     QApplication, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox,
     QFormLayout, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMenu,
-    QMessageBox, QPushButton, QSpinBox, QSystemTrayIcon, QTextEdit,
+    QMessageBox, QProgressBar, QPushButton, QSpinBox, QSystemTrayIcon, QTextEdit,
     QVBoxLayout, QWidget,
 )
 from pynput import keyboard
@@ -462,9 +463,77 @@ def make_mic_icon(color="#2b2b2b"):
 STATUS_STYLES = {
     "ready":        ("#f3f3f3", "#222"),
     "recording":    ("#fde2e2", "#a00000"),
+    "recording-quiet": ("#ffe8cc", "#9a5b00"),
     "transcribing": ("#fff3cc", "#8a6d00"),
     "error":        ("#ffd6d6", "#9a0000"),
 }
+
+#: Peak below this (of 32768) counts as silence -- same line core.py uses
+#: when it reports "microphone was silent".
+SILENCE_PEAK = 300
+
+
+def _dbfs(peak):
+    """Peak (0..32768) as dBFS, floored at -60 dB for display."""
+    if peak <= 0:
+        return -60.0
+    return max(-60.0, 20 * math.log10(peak / 32768))
+
+
+class _RecStatusItem:
+    """Recording indicator in the macOS menu bar (top right, next to the
+    clock): a blinking red dot plus elapsed time while recording, and a
+    NO SIGNAL warning when the mic stays silent. Native NSStatusItem, so it
+    is visible no matter which app is frontmost -- unlike an in-app window,
+    which hides together with Dictate. All calls must happen on the main
+    thread; every method fails silently so a menu-bar hiccup can never
+    break a recording."""
+
+    def __init__(self):
+        self._item = None
+
+    def show(self):
+        try:
+            from AppKit import NSStatusBar, NSVariableStatusItemLength
+            if self._item is None:
+                self._item = NSStatusBar.systemStatusBar(
+                    ).statusItemWithLength_(NSVariableStatusItemLength)
+            self._update("● REC", False)
+            core.log.info("menu indicator shown")
+        except Exception:
+            core.log.exception("menu indicator failed")
+
+    def update(self, elapsed_secs, quiet):
+        try:
+            if self._item is None:
+                return
+            dot = "●" if int(elapsed_secs * 2) % 2 == 0 else "○"
+            label = "NO SIGNAL" if quiet else (
+                f"REC {elapsed_secs // 60:02d}:{elapsed_secs % 60:02d}")
+            self._update(f"{dot} {label}", True)
+        except Exception:
+            pass
+
+    def hide(self):
+        try:
+            if self._item is not None:
+                from AppKit import NSStatusBar
+                NSStatusBar.systemStatusBar().removeStatusItem_(self._item)
+                self._item = None
+        except Exception:
+            pass
+
+    def _update(self, text, red):
+        from AppKit import (NSColor, NSForegroundColorAttributeName,
+                            NSMutableAttributedString)
+        s = NSMutableAttributedString.alloc().initWithString_(text)
+        dot_color = NSColor.redColor() if red else NSColor.labelColor()
+        s.addAttribute_value_range_(
+            NSForegroundColorAttributeName, dot_color, (0, 1))
+        s.addAttribute_value_range_(
+            NSForegroundColorAttributeName, NSColor.labelColor(),
+            (1, max(len(text) - 1, 1)))
+        self._item.button().setAttributedTitle_(s)
 
 
 class MainWindow(QMainWindow):
@@ -494,6 +563,14 @@ class MainWindow(QMainWindow):
         self._cmd_tap_interrupted = False
         self._last_dictation_app = None
         self._dictation_target = None
+        self._silent_secs = 0.0
+        self._warned_nosignal = False
+        self._level_timer = QTimer(self)
+        self._level_timer.setInterval(100)
+        self._level_timer.timeout.connect(self._update_level)
+        self._recitem = _RecStatusItem()
+        self._rec_start = 0.0
+        self._rec_wall = None
 
         self.press_time = 0.0
 
@@ -516,6 +593,18 @@ class MainWindow(QMainWindow):
         self.status_label = QLabel("Ready")
         self.status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         v.addWidget(self.status_label)
+
+        level_row = QHBoxLayout()
+        self.level_bar = QProgressBar()
+        self.level_bar.setRange(0, 100)
+        self.level_bar.setValue(0)
+        self.level_bar.setTextVisible(False)
+        self.level_bar.setMaximumHeight(10)
+        level_row.addWidget(self.level_bar, stretch=1)
+        self.level_label = QLabel("Level: --")
+        self.level_label.setStyleSheet("color: #666;")
+        level_row.addWidget(self.level_label)
+        v.addLayout(level_row)
 
         self.info_label = QLabel()
         self.info_label.setStyleSheet("color: #666; padding: 2px 0;")
@@ -721,6 +810,7 @@ class MainWindow(QMainWindow):
         self.key_held = False
         self.combo = False
         self.recording_active = False
+        self._stop_level_meter()
         self.start_listener()
 
     def on_press(self):
@@ -798,30 +888,68 @@ class MainWindow(QMainWindow):
         # Remember where the text belongs BEFORE hiding: whoever is frontmost
         # now is the dictation target. Typing later goes there even if the
         # user brought Dictate forward while waiting (its read-only pane
-        # would otherwise swallow the keystrokes unnoticed).
-        self._dictation_target = self._frontmost_app_id()
+        # would otherwise swallow the keystrokes unnoticed). Triggered from
+        # inside Dictate itself, fall back to the last target.
+        target = self._frontmost_app_id()
+        if target and self._is_own_app(target):
+            target = self._last_dictation_app
+        self._dictation_target = target
         self.set_status("recording", "Recording...")
+        self._silent_secs = 0.0
+        self._warned_nosignal = False
+        self._rec_start = time.monotonic()
+        self._rec_wall = time.strftime("%Y-%m-%d_%H-%M-%S")
+        self.level_bar.setValue(0)
+        self.level_label.setText("Level: --")
+        self._level_timer.start()
         self._hide_for_dictation()
         return True
 
     def _hide_for_dictation(self):
-        """Give the previous application input focus while Dictate records."""
-        if sys.platform == "darwin":
-            try:
-                # Hiding the complete NSApplication, rather than merely this
-                # window, makes macOS activate the previously used app.
-                from AppKit import NSApp
-                NSApp.hide_(None)
-                return
-            except Exception:
-                pass
+        """Hide the main window; the menu-bar item keeps recording visible
+        while the dictation target keeps (or regains) keyboard focus."""
         self.hide()
+        if self._dictation_target:
+            self._focus_app(self._dictation_target)
+        self._recitem.show()
+
+    def _stop_level_meter(self):
+        self._level_timer.stop()
+        self._recitem.hide()
+        self.level_bar.setValue(0)
+        self.level_label.setText("Level: --")
+
+    def _update_level(self):
+        if not self.recording_active:
+            return
+        try:
+            peak = self.recorder.level()
+        except Exception:
+            return
+        pct = min(int(100 * (peak / 32768) ** 0.5), 100) if peak > 0 else 0
+        self.level_bar.setValue(pct)
+        elapsed = int(time.monotonic() - self._rec_start) if self._rec_start else 0
+        if peak < SILENCE_PEAK:
+            self._silent_secs += 0.1
+            self.level_label.setText("Level: silence")
+        else:
+            self._silent_secs = 0.0
+            self.level_label.setText(f"Level: {_dbfs(peak):.0f} dB")
+        if self._silent_secs >= 3.0 and not self._warned_nosignal:
+            self._warned_nosignal = True
+            self.set_status("recording-quiet", "Recording... (NO SIGNAL -- check mic)")
+            core.log.warning("recording silent for %.0fs", self._silent_secs)
+        elif self._warned_nosignal and self._silent_secs == 0.0:
+            self._warned_nosignal = False
+            self.set_status("recording", "Recording...")
+        self._recitem.update(elapsed, self._warned_nosignal)
 
     def stop_and_transcribe(self):
         # recorder.stop() can block for hundreds of ms on PipeWire close,
         # which freezes the GUI ("main on_release doesn't return"). Move the
         # whole pipeline (stop + transcribe) onto a worker thread and update
         # status immediately from the main thread instead.
+        self._stop_level_meter()
         self.set_status("transcribing", "Transcribing...")
         # Detach here, on the GUI thread: the take now belongs to the worker,
         # so pressing the hotkey again right away starts a fresh recording
@@ -830,6 +958,7 @@ class MainWindow(QMainWindow):
         threading.Thread(target=self._stop_and_transcribe_worker, args=(take,), daemon=True).start()
 
     def _discard_take(self):
+        self._stop_level_meter()
         take = self.recorder.detach()
         threading.Thread(target=core.Recorder.finish, args=(take,), daemon=True).start()
 
@@ -882,6 +1011,8 @@ class MainWindow(QMainWindow):
             core.type_text((" " if needs_space else "") + text)
             self._last_dictation_app = target_app
             self.last.setPlainText(text)
+            core.archive_transcript(text, when=self._rec_wall)
+            self._rec_wall = None
         self.set_status("ready", "Ready")
 
     @staticmethod
@@ -897,6 +1028,17 @@ class MainWindow(QMainWindow):
             return None
 
     @staticmethod
+    def _is_own_app(bundle_id):
+        if sys.platform != "darwin":
+            return False
+        try:
+            from AppKit import NSRunningApplication
+            mine = NSRunningApplication.currentApplication().bundleIdentifier()
+            return str(bundle_id) == str(mine)
+        except Exception:
+            return False
+
+    @staticmethod
     def _focus_app(bundle_id):
         """Bring the dictation target forward before typing. NO-OP unless it
         is needed: if Dictate itself (or the target already) is frontmost,
@@ -909,10 +1051,9 @@ class MainWindow(QMainWindow):
                                 NSApplicationActivateIgnoringOtherApps,
                                 NSWorkspace)
             ws = NSWorkspace.sharedWorkspace()
-            mine = NSRunningApplication.currentApplication().bundleIdentifier()
             front = ws.frontmostApplication()
             front_id = str(front.bundleIdentifier()) if front else None
-            if str(bundle_id) == str(mine) or str(bundle_id) == str(front_id):
+            if MainWindow._is_own_app(bundle_id) or str(bundle_id) == str(front_id):
                 return
             for app in ws.runningApplications():
                 if str(app.bundleIdentifier()) == str(bundle_id):
